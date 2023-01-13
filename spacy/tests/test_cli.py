@@ -3,7 +3,10 @@ import math
 from collections import Counter
 from typing import Tuple, List, Dict, Any
 import pkg_resources
+import time
+from pathlib import Path
 
+import spacy
 import numpy
 import pytest
 import srsly
@@ -13,7 +16,7 @@ from thinc.api import Config, ConfigValidationError
 
 from spacy import about
 from spacy.cli import info
-from spacy.cli._util import is_subpath_of, load_project_config
+from spacy.cli._util import is_subpath_of, load_project_config, walk_directory
 from spacy.cli._util import parse_config_overrides, string_to_list
 from spacy.cli._util import substitute_project_variables
 from spacy.cli._util import validate_project_commands
@@ -28,8 +31,10 @@ from spacy.cli.download import get_compatibility, get_version
 from spacy.cli.init_config import RECOMMENDATIONS, init_config, fill_config
 from spacy.cli.package import get_third_party_dependencies
 from spacy.cli.package import _is_permitted_package_name
+from spacy.cli.project.remote_storage import RemoteStorage
 from spacy.cli.project.run import _check_requirements
 from spacy.cli.validate import get_model_pkgs
+from spacy.cli.apply import apply
 from spacy.cli.find_threshold import find_threshold
 from spacy.lang.en import English
 from spacy.lang.nl import Dutch
@@ -119,6 +124,25 @@ def test_issue7055():
     assert filled_cfg["components"]["tagger"]["source"] == str(source_path)
     assert filled_cfg["components"]["ner"]["factory"] == "ner"
     assert "model" in filled_cfg["components"]["ner"]
+
+
+@pytest.mark.issue(11235)
+def test_issue11235():
+    """
+    Test that the cli handles interpolation in the directory names correctly when loading project config.
+    """
+    lang_var = "en"
+    variables = {"lang": lang_var}
+    commands = [{"name": "x", "script": ["hello ${vars.lang}"]}]
+    directories = ["cfg", "${vars.lang}_model"]
+    project = {"commands": commands, "vars": variables, "directories": directories}
+    with make_tempdir() as d:
+        srsly.write_yaml(d / "project.yml", project)
+        cfg = load_project_config(d)
+        # Check that the directories are interpolated and created correctly
+        assert os.path.exists(d / "cfg")
+        assert os.path.exists(d / f"{lang_var}_model")
+    assert cfg["commands"][0]["script"][0] == f"hello {lang_var}"
 
 
 def test_cli_info():
@@ -594,6 +618,7 @@ def test_string_to_list_intify(value):
     assert string_to_list(value, intify=True) == [1, 2, 3]
 
 
+@pytest.mark.skip(reason="Temporarily skip for dev version")
 def test_download_compatibility():
     spec = SpecifierSet("==" + about.__version__)
     spec.prereleases = False
@@ -604,6 +629,7 @@ def test_download_compatibility():
         assert get_minor_version(about.__version__) == get_minor_version(version)
 
 
+@pytest.mark.skip(reason="Temporarily skip for dev version")
 def test_validate_compatibility_table():
     spec = SpecifierSet("==" + about.__version__)
     spec.prereleases = False
@@ -862,6 +888,136 @@ def test_span_length_freq_dist_output_must_be_correct():
     assert list(span_freqs.keys()) == [3, 1, 4, 5, 2]
 
 
+def test_applycli_empty_dir():
+    with make_tempdir() as data_path:
+        output = data_path / "test.spacy"
+        apply(data_path, output, "blank:en", "text", 1, 1)
+
+
+def test_applycli_docbin():
+    with make_tempdir() as data_path:
+        output = data_path / "testout.spacy"
+        nlp = spacy.blank("en")
+        doc = nlp("testing apply cli.")
+        # test empty DocBin case
+        docbin = DocBin()
+        docbin.to_disk(data_path / "testin.spacy")
+        apply(data_path, output, "blank:en", "text", 1, 1)
+        docbin.add(doc)
+        docbin.to_disk(data_path / "testin.spacy")
+        apply(data_path, output, "blank:en", "text", 1, 1)
+
+
+def test_applycli_jsonl():
+    with make_tempdir() as data_path:
+        output = data_path / "testout.spacy"
+        data = [{"field": "Testing apply cli.", "key": 234}]
+        data2 = [{"field": "234"}]
+        srsly.write_jsonl(data_path / "test.jsonl", data)
+        apply(data_path, output, "blank:en", "field", 1, 1)
+        srsly.write_jsonl(data_path / "test2.jsonl", data2)
+        apply(data_path, output, "blank:en", "field", 1, 1)
+
+
+def test_applycli_txt():
+    with make_tempdir() as data_path:
+        output = data_path / "testout.spacy"
+        with open(data_path / "test.foo", "w") as ftest:
+            ftest.write("Testing apply cli.")
+        apply(data_path, output, "blank:en", "text", 1, 1)
+
+
+def test_applycli_mixed():
+    with make_tempdir() as data_path:
+        output = data_path / "testout.spacy"
+        text = "Testing apply cli"
+        nlp = spacy.blank("en")
+        doc = nlp(text)
+        jsonl_data = [{"text": text}]
+        srsly.write_jsonl(data_path / "test.jsonl", jsonl_data)
+        docbin = DocBin()
+        docbin.add(doc)
+        docbin.to_disk(data_path / "testin.spacy")
+        with open(data_path / "test.txt", "w") as ftest:
+            ftest.write(text)
+        apply(data_path, output, "blank:en", "text", 1, 1)
+        # Check whether it worked
+        result = list(DocBin().from_disk(output).get_docs(nlp.vocab))
+        assert len(result) == 3
+        for doc in result:
+            assert doc.text == text
+
+
+def test_applycli_user_data():
+    Doc.set_extension("ext", default=0)
+    val = ("ext", 0)
+    with make_tempdir() as data_path:
+        output = data_path / "testout.spacy"
+        nlp = spacy.blank("en")
+        doc = nlp("testing apply cli.")
+        doc._.ext = val
+        docbin = DocBin(store_user_data=True)
+        docbin.add(doc)
+        docbin.to_disk(data_path / "testin.spacy")
+        apply(data_path, output, "blank:en", "", 1, 1)
+        result = list(DocBin().from_disk(output).get_docs(nlp.vocab))
+        assert result[0]._.ext == val
+
+
+def test_local_remote_storage():
+    with make_tempdir() as d:
+        filename = "a.txt"
+
+        content_hashes = ("aaaa", "cccc", "bbbb")
+        for i, content_hash in enumerate(content_hashes):
+            # make sure that each subsequent file has a later timestamp
+            if i > 0:
+                time.sleep(1)
+            content = f"{content_hash} content"
+            loc_file = d / "root" / filename
+            if not loc_file.parent.exists():
+                loc_file.parent.mkdir(parents=True)
+            with loc_file.open(mode="w") as file_:
+                file_.write(content)
+
+            # push first version to remote storage
+            remote = RemoteStorage(d / "root", str(d / "remote"))
+            remote.push(filename, "aaaa", content_hash)
+
+            # retrieve with full hashes
+            loc_file.unlink()
+            remote.pull(filename, command_hash="aaaa", content_hash=content_hash)
+            with loc_file.open(mode="r") as file_:
+                assert file_.read() == content
+
+            # retrieve with command hash
+            loc_file.unlink()
+            remote.pull(filename, command_hash="aaaa")
+            with loc_file.open(mode="r") as file_:
+                assert file_.read() == content
+
+            # retrieve with content hash
+            loc_file.unlink()
+            remote.pull(filename, content_hash=content_hash)
+            with loc_file.open(mode="r") as file_:
+                assert file_.read() == content
+
+            # retrieve with no hashes
+            loc_file.unlink()
+            remote.pull(filename)
+            with loc_file.open(mode="r") as file_:
+                assert file_.read() == content
+
+
+def test_local_remote_storage_pull_missing():
+    # pulling from a non-existent remote pulls nothing gracefully
+    with make_tempdir() as d:
+        filename = "a.txt"
+        remote = RemoteStorage(d / "root", str(d / "remote"))
+        assert remote.pull(filename, command_hash="aaaa") is None
+        assert remote.pull(filename) is None
+
+
 def test_cli_find_threshold(capsys):
     thresholds = numpy.linspace(0, 1, 10)
 
@@ -1030,3 +1186,26 @@ def test_upload_download_local_file():
         download_file(remote_file, local_file)
         with local_file.open(mode="r") as file_:
             assert file_.read() == content
+
+
+def test_walk_directory():
+    with make_tempdir() as d:
+        files = [
+            "data1.iob",
+            "data2.iob",
+            "data3.json",
+            "data4.conll",
+            "data5.conll",
+            "data6.conll",
+            "data7.txt",
+        ]
+
+        for f in files:
+            Path(d / f).touch()
+
+        assert (len(walk_directory(d))) == 7
+        assert (len(walk_directory(d, suffix=None))) == 7
+        assert (len(walk_directory(d, suffix="json"))) == 1
+        assert (len(walk_directory(d, suffix="iob"))) == 2
+        assert (len(walk_directory(d, suffix="conll"))) == 3
+        assert (len(walk_directory(d, suffix="pdf"))) == 0

@@ -145,8 +145,8 @@ def test_matcher_match_multi(matcher):
         # caching don't collide)
         (
             {
-                "A": [[{"ORTH": {"FUZZY": "Javascript"}}]],
-                "B": [[{"ORTH": {"FUZZY5": "Javascript"}}]],
+                "A": [[{"ORTH": {"FUZZY": "Javascripts"}}]],
+                "B": [[{"ORTH": {"FUZZY5": "Javascripts"}}]],
             },
             [(8, 9)],
         ),
@@ -198,15 +198,20 @@ def test_matcher_match_fuzzy_set_multiple(en_vocab):
     ]
 
 
-@pytest.mark.parametrize("fuzzyn", range(1, 6))
-def test_matcher_match_fuzzyn(en_vocab, fuzzyn):
+@pytest.mark.parametrize("fuzzyn", range(1, 10))
+def test_matcher_match_fuzzyn_all_insertions(en_vocab, fuzzyn):
     matcher = Matcher(en_vocab)
     matcher.add("GoogleNow", [[{"ORTH": {f"FUZZY{fuzzyn}": "GoogleNow"}}]])
     # words with increasing edit distance
-    words = ["GoogleNow" + "a" * i for i in range(0, 6)]
+    words = ["GoogleNow" + "a" * i for i in range(0, 10)]
     doc = Doc(en_vocab, words)
     assert len(matcher(doc)) == fuzzyn + 1
 
+
+@pytest.mark.parametrize("fuzzyn", range(1, 6))
+def test_matcher_match_fuzzyn_various_edits(en_vocab, fuzzyn):
+    matcher = Matcher(en_vocab)
+    matcher.add("GoogleNow", [[{"ORTH": {f"FUZZY{fuzzyn}": "GoogleNow"}}]])
     # words with increasing edit distance of different edit types
     words = [
         "GoogleNow",
@@ -220,18 +225,24 @@ def test_matcher_match_fuzzyn(en_vocab, fuzzyn):
     assert len(matcher(doc)) == fuzzyn + 1
 
 
+@pytest.mark.parametrize("greedy", ["FIRST", "LONGEST"])
 @pytest.mark.parametrize("set_op", ["IN", "NOT_IN"])
-def test_matcher_match_fuzzyn_set_op_longest(en_vocab, set_op):
+def test_matcher_match_fuzzyn_set_op_longest(en_vocab, greedy, set_op):
     rules = {
         "GoogleNow": [[{"ORTH": {"FUZZY2": {set_op: ["Google", "Now"]}}, "OP": "+"}]]
     }
     matcher = Matcher(en_vocab)
     for key, patterns in rules.items():
-        matcher.add(key, patterns, greedy="LONGEST")
+        matcher.add(key, patterns, greedy=greedy)
 
     words = ["They", "like", "Goggle", "Noo"]
     doc = Doc(matcher.vocab, words=words)
-    assert len(matcher(doc)) == 1
+    spans = matcher(doc, as_spans=True)
+    assert len(spans) == 1
+    if set_op == "IN":
+        assert spans[0].text == "Goggle Noo"
+    else:
+        assert spans[0].text == "They like"
 
 
 def test_matcher_match_fuzzyn_set_multiple(en_vocab):
